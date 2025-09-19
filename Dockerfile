@@ -17,5 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY handler.py .
 
 # Set the command to start the RunPod worker
-CMD ["python", "runpod_handler.py"]
+CMD ["python", "handler.py"]
+
 
