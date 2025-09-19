@@ -1,5 +1,5 @@
 # RunPod Serverless SDK
-runpod==1.9.1
+runpod
 
 # Hugging Face + stereo MusicGen
 transformers==4.44.2
@@ -12,3 +12,4 @@ torch==2.4.1
 torchaudio==2.4.1
 soundfile==0.12.1
 numpy==1.26.4
+
