@@ -14,7 +14,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the serverless handler script
-COPY runpod_handler.py .
+COPY handler.py .
 
 # Set the command to start the RunPod worker
 CMD ["python", "runpod_handler.py"]
+
