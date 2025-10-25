@@ -1,125 +1,162 @@
 import os
 import torch
-import numpy as np
-import soundfile as sf
-from io import BytesIO
-import base64
-import traceback
+import torchaudio
 import runpod
-from transformers import pipeline
+import base64
+from io import BytesIO
+import numpy as np
+from scipy.io import wavfile
+from scipy import signal
+import traceback
+import requests
+import urllib.parse
 
-# --- Path for Initialization Error Logging ---
+# --- Global Variables & Model Loading with Error Catching ---
 INIT_ERROR_FILE = "/tmp/init_error.log"
+model = None
 
-# --- Global Model Loading ---
-synth = None
 try:
-    # Clear any previous error logs
     if os.path.exists(INIT_ERROR_FILE):
         os.remove(INIT_ERROR_FILE)
-
-    print("Loading facebook/musicgen-stereo-medium...")
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        
+    print("Loading MusicGen stereo-medium model...")
+    from audiocraft.models import MusicGen
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-
-    # Load the stereo model using the transformers pipeline
-    synth = pipeline(
-        "text-to-audio",
-        "facebook/musicgen-stereo-medium",
-        device=device,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    )
+    
+    # ✅ ONLY CHANGE: Use musicgen-stereo-medium
+    model = MusicGen.get_pretrained("facebook/musicgen-stereo-medium", device=device)
     print("✅ Model loaded successfully.")
 
 except Exception as e:
-    # If loading fails, log the full error traceback
     tb_str = traceback.format_exc()
     with open(INIT_ERROR_FILE, "w") as f:
         f.write(f"Failed to initialize model: {tb_str}")
-    synth = None # Ensure the model is None if loading failed
+    model = None
 
+# --- Helper Functions (Identical to other endpoints) ---
+def upsample_audio(input_wav_bytes, target_sr=48000):
+    try:
+        with BytesIO(input_wav_bytes) as in_io:
+            sr, audio = wavfile.read(in_io)
+
+        up_factor = target_sr / sr
+        upsampled_audio = signal.resample(audio, int(len(audio) * up_factor))
+        if audio.dtype == np.int16:
+            upsampled_audio = upsampled_audio.astype(np.int16)
+
+        with BytesIO() as out_io:
+            wavfile.write(out_io, target_sr, upsampled_audio)
+            return out_io.getvalue()
+    except Exception:
+        return input_wav_bytes
+
+def upload_to_gcs(signed_url, audio_bytes, content_type="audio/wav"):
+    """Upload audio to Google Cloud Storage using signed URL"""
+    try:
+        response = requests.put(
+            signed_url,
+            data=audio_bytes,
+            headers={"Content-Type": content_type},
+            timeout=300
+        )
+        response.raise_for_status()
+        print(f"✅ Uploaded to GCS: {signed_url[:100]}...")
+        return True
+    except Exception as e:
+        print(f"❌ GCS upload failed: {e}")
+        return False
+
+def notify_backend(callback_url, status, error_message=None):
+    """Send webhook notification to backend"""
+    try:
+        parsed = urllib.parse.urlparse(callback_url)
+        params = urllib.parse.parse_qs(parsed.query)
+        params['status'] = [status]
+        if error_message:
+            params['error_message'] = [error_message]
+        
+        new_query = urllib.parse.urlencode(params, doseq=True)
+        webhook_url = urllib.parse.urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, new_query, parsed.fragment
+        ))
+        
+        print(f"🔔 Calling webhook: {webhook_url}")
+        response = requests.post(webhook_url, timeout=30)
+        response.raise_for_status()
+        print(f"✅ Backend notified: {status}")
+        return True
+    except Exception as e:
+        print(f"❌ Webhook notification failed: {e}")
+        return False
 
 # --- Runpod Handler ---
 def handler(event):
-    """
-    The handler function that will be called by Runpod for each job.
-    """
-    # --- Check for Initialization Error First ---
     if os.path.exists(INIT_ERROR_FILE):
         with open(INIT_ERROR_FILE, "r") as f:
-            error_message = f.read()
-        return {"error": f"Worker initialization failed: {error_message}"}
+            error_msg = f"Worker initialization failed: {f.read()}"
+        return {"error": error_msg}
 
-    if synth is None:
-        return {"error": "Model is not loaded. Check initialization logs."}
-
-    # --- Input Validation ---
     job_input = event.get("input", {})
     text = job_input.get("text")
-    duration = job_input.get("duration", 30)  # Default to 30 seconds
-
+    callback_url = job_input.get("callback_url")
+    upload_urls = job_input.get("upload_urls", {})
+    
     if not text:
-        return {"error": "No 'text' prompt provided."}
-
-    # --- Music Generation ---
+        error_msg = "No text prompt provided."
+        if callback_url:
+            notify_backend(callback_url, "failed", error_msg)
+        return {"error": error_msg}
+    
     try:
-        print(f"Generating {duration}s stereo audio for prompt: '{text}'")
-
-        # Break generation into manageable chunks of 30 seconds
-        chunk_size = 30
-        num_chunks = (duration + chunk_size - 1) // chunk_size
-        all_chunks = []
-        final_sr = 32000  # Will be updated by the model
-
-        for i in range(num_chunks):
-            chunk_duration = min(chunk_size, duration - (i * chunk_size))
-            max_new_tokens = int(chunk_duration * 50) # Approx. 50 tokens per second
-            print(f"Generating chunk {i+1}/{num_chunks} ({chunk_duration}s)...")
-
-            result = synth(
-                text,
-                forward_params={"max_new_tokens": max_new_tokens}
-            )
-
-            audio = result["audio"][0]
-            final_sr = result["sampling_rate"]
-
-            # Ensure the output is stereo
-            if audio.ndim == 1:
-                audio = np.stack([audio, audio], axis=-1)
-            elif audio.shape[0] < audio.shape[1]:
-                audio = audio.T # Ensure shape is (samples, channels)
-
-            if audio.dtype != np.float32:
-                audio = audio.astype(np.float32)
-
-            all_chunks.append(audio)
-
-        # Concatenate all generated audio chunks
-        final_audio = np.concatenate(all_chunks, axis=0)
-
-        # Save to an in-memory buffer
+        duration = job_input.get("duration", 120)
+        sample_rate = job_input.get("sample_rate", 32000)
+        
+        print(f"🎵 Generating audio: prompt='{text}', duration={duration}s")
+        
+        model.set_generation_params(duration=duration)
+        res = model.generate([text])
+        audio_tensor = res[0].cpu()
+        
         buffer = BytesIO()
-        sf.write(buffer, final_audio, final_sr, format="WAV", subtype="PCM_16")
-        wav_bytes = buffer.getvalue()
-
-        # Encode the audio data as a base64 string
-        audio_base64 = base64.b64encode(wav_bytes).decode('utf-8')
-
-        print("✅ Generation complete.")
+        torchaudio.save(buffer, audio_tensor, model.sample_rate, format="wav")
+        raw_wav_bytes = buffer.getvalue()
+        
+        final_wav_bytes = raw_wav_bytes
+        if sample_rate == 48000:
+            final_wav_bytes = upsample_audio(raw_wav_bytes, target_sr=48000)
+        
+        print(f"✅ Audio generated: {len(final_wav_bytes)} bytes")
+        
+        if upload_urls:
+            wav_url = upload_urls.get("wav_url")
+            if wav_url:
+                upload_success = upload_to_gcs(wav_url, final_wav_bytes)
+                if not upload_success:
+                    raise Exception("Failed to upload WAV to GCS")
+        
+        if callback_url:
+            notify_backend(callback_url, "completed")
+        
+        audio_base64 = base64.b64encode(final_wav_bytes).decode('utf-8')
+        
         return {
             "audio_base64": audio_base64,
-            "sample_rate": final_sr,
-            "format": "wav"
+            "sample_rate": sample_rate,
+            "format": "wav",
+            "status": "completed"
         }
-
+        
     except Exception as e:
-        error_trace = traceback.format_exc()
-        print(f"Generation failed: {error_trace}")
-        return {"error": f"An error occurred during generation: {error_trace}"}
-
+        error_msg = traceback.format_exc()
+        print(f"❌ Error: {error_msg}")
+        
+        if callback_url:
+            notify_backend(callback_url, "failed", str(e))
+        
+        return {"error": error_msg, "status": "failed"}
 
 # --- Start Serverless Worker ---
-if __name__ == "__main__":
-    print("Starting RunPod serverless worker...")
-    runpod.serverless.start({"handler": handler})
+runpod.serverless.start({"handler": handler})
